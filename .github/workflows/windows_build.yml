@@ -1,0 +1,350 @@
+name: windows-build
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'main'
+  pull_request:
+    types:
+      - labeled
+      - synchronize
+
+concurrency:
+  # One concurrency group per workflow + ref.
+  #
+  # - PRs use `refs/pull/<PR_NUMBER>/merge`, so new commits cancel older
+  #   in-progress runs for the same PR.
+  # - A merge does NOT cancel the PR's own runs: this group is keyed on
+  #   refs/pull/<N>/merge and the master push on refs/heads/master, so they
+  #   never share a group. See the cancel-pr-runs-on-close workflow.
+  # - Branch pushes are isolated by ref.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest]
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.os }}
+    env:
+      BOOST_ROOT: C:\local\boost_1_87_0
+    steps:
+      - uses: actions/checkout@v7
+      # Cache the fetched Boost + MySQL client so we don't re-download ~350 MB
+      # and re-run the Boost installer on every run. The Test-Path guards in
+      # "Configure OS" short-circuit the install work when these are restored.
+      - name: Cache Boost & MySQL
+        uses: actions/cache@v6
+        with:
+          path: |
+            C:\local\boost_1_87_0
+            C:\tools\mysql\current
+          key: winbuild-deps:boost-1.87.0:mysql-8.4.9
+      - name: Configure OS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # The windows-latest runner image already ships CMake, Visual Studio
+          # (with the native desktop workload + MSVC) and OpenSSL, so we only need to
+          # provide Boost and the MySQL client libraries. We fetch these directly
+          # instead of via chocolatey, whose pinned packages keep breaking on CI
+          # (VS detection failures and slproweb removing old OpenSSL installers).
+
+          # --- Boost 1.87.0 (msvc-14.3, 64-bit) prebuilt binaries -> C:\local\boost_1_87_0 (BOOST_ROOT) ---
+          # Go through downloads.sourceforge.net, which hands out an https mirror. The
+          # master.dl host redirects to a plain-http URL that PowerShell 7.4+ refuses
+          # to follow, and an installer we then execute shouldn't travel in the clear anyway.
+          # SourceForge sniffs the user agent: anything starting with Mozilla gets the HTML
+          # download page instead of the file, so send a non-browser one. Note this is the
+          # opposite of what the MySQL archives CDN below wants.
+          if (-not (Test-Path 'C:\local\boost_1_87_0\boost'))
+          {
+              $boostExe = Join-Path $env:RUNNER_TEMP 'boost.exe'
+              $boostUrl = 'https://downloads.sourceforge.net/project/boost/boost-binaries/' +
+                  '1.87.0/boost_1_87_0-msvc-14.3-64.exe'
+              # Mirrors drop connections often enough on a 200 MB file to be worth retrying.
+              # OperationTimeoutSeconds is the one that catches a mirror going quiet mid-transfer,
+              # which would otherwise hang the job until the 6h runner limit. Don't collapse
+              # the two into a whole-transfer budget, slow mirrors can need 15+ minutes.
+              $boostRequest = @{
+                  Uri                      = $boostUrl
+                  OutFile                  = $boostExe
+                  UserAgent                = 'azerothcore-ci'
+                  ConnectionTimeoutSeconds = 60
+                  OperationTimeoutSeconds  = 60
+              }
+              $boostAttempts = 3
+              for ($attempt = 1; $attempt -le $boostAttempts; $attempt++)
+              {
+                  try
+                  {
+                      Invoke-WebRequest @boostRequest
+                      # A mirror can answer 200 with an error page, which doesn't throw. Size-check
+                      # inside the loop so a bad payload retries onto a different mirror instead of
+                      # failing the job outright. Each attempt re-rolls the mirror.
+                      $boostMB = (Get-Item $boostExe).Length / 1MB
+                      if ($boostMB -lt 50) { throw "got $([int]$boostMB) MB, likely an HTML page." }
+                      break
+                  }
+                  catch
+                  {
+                      Write-Host "Boost download attempt $attempt failed: $($_.Exception.Message)"
+                      if ($attempt -eq $boostAttempts) { throw }
+                      Start-Sleep -Seconds 15
+                  }
+              }
+              Write-Host ("Downloaded Boost installer: {0:N1} MB" -f $boostMB)
+              $boostProc = Start-Process -FilePath $boostExe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/DIR=C:\local\boost_1_87_0' -Wait -PassThru
+              if ($boostProc.ExitCode -ne 0) { throw "Boost installer failed with exit code $($boostProc.ExitCode)." }
+              # Fail fast if the installer "succeeded" but didn't lay down the expected tree,
+              # instead of surfacing a cryptic error later during CMake configuration.
+              if (-not (Test-Path 'C:\local\boost_1_87_0\boost\version.hpp')) { throw 'Boost install missing headers at C:\local\boost_1_87_0\boost.' }
+              if (-not (Test-Path 'C:\local\boost_1_87_0\lib64-msvc-14.3')) { throw 'Boost install missing prebuilt libs at C:\local\boost_1_87_0\lib64-msvc-14.3.' }
+          }
+
+          # --- MySQL 8.4 client headers + libs -> C:\tools\mysql\current (path the build expects) ---
+          if (-not (Test-Path 'C:\tools\mysql\current\lib\mysqlclient.lib'))
+          {
+              # Use the archives CDN directly (keeps every version, unlike dev.mysql.com/get which only
+              # serves the current GA). A browser user-agent is required or Oracle returns an HTML error page.
+              $mysqlZip = Join-Path $env:RUNNER_TEMP 'mysql.zip'
+              Invoke-WebRequest -Uri 'https://cdn.mysql.com/archives/mysql-8.4/mysql-8.4.9-winx64.zip' -OutFile $mysqlZip -UserAgent 'Mozilla/5.0'
+              $mysqlMB = (Get-Item $mysqlZip).Length / 1MB
+              Write-Host ("Downloaded MySQL zip: {0:N1} MB" -f $mysqlMB)
+              if ($mysqlMB -lt 50) { throw "MySQL zip download looks wrong ($([int]$mysqlMB) MB)." }
+              New-Item -ItemType Directory -Force -Path 'C:\tools\mysql' | Out-Null
+              Expand-Archive -Path $mysqlZip -DestinationPath 'C:\tools\mysql' -Force
+              if (Test-Path 'C:\tools\mysql\current') { Remove-Item -Recurse -Force 'C:\tools\mysql\current' }
+              Rename-Item 'C:\tools\mysql\mysql-8.4.9-winx64' 'C:\tools\mysql\current'
+              # Fail fast if the archive layout changed and the client import library isn't
+              # where the build expects it, rather than failing later during CMake/link.
+              if (-not (Test-Path 'C:\tools\mysql\current\lib\mysqlclient.lib')) { throw 'MySQL client import library missing at C:\tools\mysql\current\lib\mysqlclient.lib.' }
+          }
+
+          # --- OpenSSL: use the copy already installed on the runner image ---
+          $opensslRoot = @($env:OPENSSL_ROOT_DIR, 'C:\Program Files\OpenSSL', 'C:\Program Files\OpenSSL-Win64') |
+              Where-Object { $_ -and (Test-Path (Join-Path $_ 'include\openssl\opensslv.h')) } |
+              Select-Object -First 1
+          if (-not $opensslRoot)
+          {
+              throw 'No OpenSSL development install found on the runner image.'
+          }
+          "OPENSSL_ROOT_DIR=$opensslRoot" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Using OpenSSL at $opensslRoot"
+
+      - name: Detect MSVC toolset
+        # The build cache key below is scoped to the exact MSVC toolset version:
+        # objects produced by a different compiler version must never be reused.
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $instPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $instPath) { throw 'vswhere found no MSVC toolset installation.' }
+          $toolset = (Get-ChildItem (Join-Path $instPath 'VC\Tools\MSVC') -Directory |
+              Sort-Object Name -Descending | Select-Object -First 1).Name
+          if (-not $toolset) { throw "No MSVC toolset directory under $instPath." }
+          "MSVC_TOOLSET=$toolset" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "MSVC toolset: $toolset"
+
+      - name: Restore build directory cache
+        # Cache the CMake build tree (var/build/obj) so follow-up runs compile
+        # incrementally instead of paying the full MSVC build every time.
+        #
+        # Why not ccache: the build goes through `cmake --build . --config
+        # Release` on the Visual Studio multi-config generator, and MSBuild
+        # ignores CMAKE_C(XX)_COMPILER_LAUNCHER - a ccache step never
+        # participates in compilation (the previous ccache-action step never
+        # produced a single hit, which is why it was removed).
+        #
+        # The run id keeps every save unique so the newest build tree always
+        # wins; restore-keys falls back to the most recent entry for the same
+        # toolset. GitHub evicts the older multi-GB entries via LRU.
+        #
+        # Restore and save are split on purpose: a plain actions/cache@v6 only
+        # saves when the whole job succeeds, so one late failing step throws
+        # away an hour of compiled objects (that is what happened to run
+        # 40262230721). The save step below runs with `if: always()`.
+        id: build-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: var/build/obj
+          key: winbuild-obj:v1:${{ env.MSVC_TOOLSET }}:${{ github.run_id }}
+          restore-keys: |
+            winbuild-obj:v1:${{ env.MSVC_TOOLSET }}:
+
+      - name: Restore source mtimes
+        # A fresh checkout stamps every source file with the current time, so
+        # MSBuild would consider all restored .obj files stale and rebuild the
+        # world. The build-directory cache therefore carries a .src-mtimes.json
+        # manifest (written by "Record source mtimes" after the build): every
+        # tracked file whose content hash still matches gets its old timestamp
+        # back, and only sources that actually changed since the cached build
+        # recompile.
+        shell: bash
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, stat, subprocess, sys
+
+          # Agent tooling, never a build input.
+          SKIP_PREFIXES = ('.claude/',)
+
+          manifest_path = os.path.join('var', 'build', 'obj', '.src-mtimes.json')
+          if not os.path.exists(manifest_path):
+              print('no source mtime manifest on this cache - cold build semantics')
+              sys.exit(0)
+
+          with open(manifest_path, 'r', encoding='utf-8') as f:
+              manifest = json.load(f)
+
+          def tracked_regular_files():
+              raw = subprocess.check_output(['git', 'ls-files', '-z'])
+              for rel in raw.decode('utf-8', 'surrogateescape').split('\0'):
+                  if not rel or rel.startswith(SKIP_PREFIXES):
+                      continue
+                  try:
+                      st = os.lstat(rel)
+                  except OSError:
+                      continue
+                  # Only plain files: upstream tracks .claude/skills/* as symlinks
+                  # (mode 120000), and on this runner they resolve to directories
+                  # where open() raises EACCES. Submodule gitlinks are directories
+                  # here too.
+                  if not stat.S_ISREG(st.st_mode):
+                      continue
+                  yield rel
+
+          total = restored = unreadable = 0
+          for rel in tracked_regular_files():
+              total += 1
+              entry = manifest.get(rel)
+              if not entry:
+                  continue
+              try:
+                  h = hashlib.sha256()
+                  with open(rel, 'rb') as fh:
+                      for chunk in iter(lambda: fh.read(1 << 20), b''):
+                          h.update(chunk)
+                  if h.hexdigest() == entry[0]:
+                      os.utime(rel, ns=(entry[1], entry[1]))
+                      restored += 1
+              except OSError as exc:
+                  unreadable += 1
+                  print('skip %s: %s' % (rel, exc))
+
+          print('restored mtimes for %d/%d tracked files (%d unreadable)'
+                % (restored, total, unreadable))
+          PY
+
+      - name: Build
+        shell: bash
+        run: |
+          export CTOOLS_BUILD=all
+          ./acore.sh compiler build
+
+      - name: Record source mtimes
+        # Snapshot content hash + mtime of every tracked file so the next run
+        # can decide (see "Restore source mtimes") which sources are
+        # unchanged. Lives inside var/build/obj so it always travels with the
+        # objects it was recorded against.
+        #
+        # continue-on-error: this step must never fail the job - a failure here
+        # means "next run rebuilds cold", which is far cheaper than losing the
+        # build-tree cache.
+        shell: bash
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, stat, subprocess
+
+          # Agent tooling, never a build input.
+          SKIP_PREFIXES = ('.claude/',)
+
+          build_dir = os.path.join('var', 'build', 'obj')
+          os.makedirs(build_dir, exist_ok=True)
+
+          def tracked_regular_files():
+              raw = subprocess.check_output(['git', 'ls-files', '-z'])
+              for rel in raw.decode('utf-8', 'surrogateescape').split('\0'):
+                  if not rel or rel.startswith(SKIP_PREFIXES):
+                      continue
+                  try:
+                      st = os.lstat(rel)
+                  except OSError:
+                      continue
+                  # Plain files only - symlinks (.claude/skills/*, mode 120000)
+                  # and submodule gitlinks are not build inputs and cannot be
+                  # opened as files.
+                  if not stat.S_ISREG(st.st_mode):
+                      continue
+                  yield rel, st
+
+          manifest = {}
+          unreadable = 0
+          for rel, st in tracked_regular_files():
+              try:
+                  h = hashlib.sha256()
+                  with open(rel, 'rb') as fh:
+                      for chunk in iter(lambda: fh.read(1 << 20), b''):
+                          h.update(chunk)
+              except OSError as exc:
+                  unreadable += 1
+                  print('skip %s: %s' % (rel, exc))
+                  continue
+              manifest[rel] = [h.hexdigest(), st.st_mtime_ns]
+
+          out = os.path.join(build_dir, '.src-mtimes.json')
+          with open(out, 'w', encoding='utf-8') as f:
+              json.dump(manifest, f)
+          print('recorded %d tracked files into %s (%d unreadable)'
+                % (len(manifest), out, unreadable))
+          PY
+
+      - name: Report build tree size
+        # Keeps the cache-size budget visible: the repo has a 10 GB cache limit,
+        # and a build tree big enough to evict "Cache Boost & MySQL" is worth
+        # knowing about before it happens. Printed before the save so the number
+        # shows up even when the save itself is skipped or rejected.
+        if: always()
+        shell: bash
+        run: |
+          du -sh var/build/obj 2>/dev/null || true
+
+      - name: Save build directory cache
+        # `if: always()` is the whole point of splitting restore/save: the
+        # compiled objects must survive even when a later step fails. The key is
+        # unique per run, so re-running the same run id hits "cache already
+        # exists" - continue-on-error keeps that from failing the job.
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@v6
+        with:
+          path: var/build/obj
+          key: winbuild-obj:v1:${{ env.MSVC_TOOLSET }}:${{ github.run_id }}
+
+      - name: Collect binaries
+        shell: bash
+        run: |
+          set -x
+          find . \( -name "*.exe" -o -name "*.dll" \) -not -path "./deps/*" | head -60
+          mkdir -p artifact/bin
+          # On this runner the MSVC multi-config build puts everything in
+          # var/build/obj/bin/Release (obj/ + config subdir), not var/build/bin.
+          # Copy the exe output dir(s) wholesale so dlls/pdbs travel with them.
+          for d in var/build/obj/bin/Release var/build/obj/bin var/build/bin build/bin; do
+            if [ -d "$d" ]; then cp -r "$d/." artifact/bin/; fi
+          done
+          if [ -d env/dist/etc ]; then cp -r env/dist/etc artifact/etc; fi
+          find . -name "*.conf.dist" -not -path "./deps/*" -exec cp {} artifact/bin/ \; 2>/dev/null || true
+          ls -laR artifact | head -80
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coa-windows-bin
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
